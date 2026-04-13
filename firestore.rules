@@ -1,0 +1,93 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {uid} (Firebase Auth UID)
+// Fields:
+//   - uid: string (required) - The user's unique ID
+//   - displayName: string (optional) - User's name
+//   - email: string (required) - User's email
+//   - photoURL: string (optional) - Profile picture URL
+//   - bestTimes: map (optional) - { levelId: number }
+//   - totalEscapes: number (optional) - Total successful runs
+//   - createdAt: timestamp (required) - Creation time
+//   - updatedAt: timestamp (required) - Last update time
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "christian.c2969@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUrl(url) {
+      return url is string &&
+        (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('photoURL' in data) || isValidUrl(data.photoURL)) &&
+             (!('bestTimes' in data) || data.bestTimes is map) &&
+             (!('totalEscapes' in data) || data.totalEscapes is number) &&
+             data.keys().hasOnly(['uid', 'displayName', 'email', 'photoURL', 'bestTimes', 'totalEscapes', 'createdAt', 'updatedAt', 'role']);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      // Users can only read their own profile
+      // We don't allow public profiles yet to prevent PII leaks
+      allow read: if isOwner(userId) || isAdmin();
+
+      allow create: if isOwner(userId) && 
+                      isValidUser(request.resource.data) &&
+                      (!('role' in request.resource.data) || request.resource.data.role == 'user' || isAdmin());
+
+      allow update: if isOwner(userId) && 
+                      isValidUser(request.resource.data) &&
+                      // Prevent self-escalation
+                      (request.resource.data.role == resource.data.role || isAdmin()) &&
+                      // Protect immutable fields
+                      request.resource.data.uid == resource.data.uid &&
+                      request.resource.data.createdAt == resource.data.createdAt;
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

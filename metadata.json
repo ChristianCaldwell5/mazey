@@ -1,0 +1,5 @@
+{
+  "name": "Mazey",
+  "description": "A top-down maze escape game with limited vision and neon aesthetics.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,29 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Stores user progress, best times, and profile information.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "The unique Firebase Auth UID." },
+        "displayName": { "type": "string", "description": "The user's display name from Google Auth." },
+        "email": { "type": "string", "format": "email", "description": "The user's email address." },
+        "photoURL": { "type": "string", "format": "uri", "description": "The user's profile picture URL." },
+        "bestTimes": { 
+          "type": "object", 
+          "description": "A map of level IDs to best completion times in seconds." 
+        },
+        "totalEscapes": { "type": "number", "description": "Total number of successful escapes across all modes." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "When the user first logged in." },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "When the user's progress was last updated." }
+      },
+      "required": ["uid", "email"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profile and progress data."
+    }
+  }
+}
