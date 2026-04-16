@@ -1,14 +1,17 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, serverTimestamp, getDocFromServer } from 'firebase/firestore';
+import { initializeFirestore, memoryLocalCache, doc, getDoc, setDoc, updateDoc, onSnapshot, serverTimestamp, getDocFromServer } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
 // Initialize Services
-// Note: We use the firestoreDatabaseId from the config if it exists
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// We use initializeFirestore to explicitly set memory cache, avoiding IndexedDB issues in some iframe environments
+export const db = initializeFirestore(app, {
+  localCache: memoryLocalCache()
+}, firebaseConfig.firestoreDatabaseId);
+
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
