@@ -6,11 +6,28 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Trophy, Timer, RefreshCw, Move, Zap, Lock, Unlock, Key, LogIn, LogOut, User as UserIcon, Star, Settings, ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from 'lucide-react';
-import { auth, signInWithGoogle, logout, db, onAuthStateChanged, User, handleFirestoreError, OperationType } from './firebase';
-import { doc, setDoc, updateDoc, getDoc, serverTimestamp } from 'firebase/firestore';
+import {
+  getCurrentUserProfile,
+  SOCKET_URL,
+  updateBestTime,
+} from './api';
+import {
+  auth,
+  getCurrentUserIdToken,
+  signInWithGoogle,
+  logout,
+  onAuthStateChanged,
+  User,
+} from './firebase';
 import { ErrorBoundary } from './components/ErrorBoundary';
-
 import { io, Socket } from 'socket.io-client';
+import type {
+  ClientToServerEvents,
+  Lobby,
+  MultiplayerPlayer,
+  ServerToClientEvents,
+} from './multiplayer/contracts';
+import { PLAYER_COLORS } from './multiplayer/contracts';
 
 const TILE_SIZE = 32;
 const VISION_RADIUS = 180;
@@ -25,37 +42,6 @@ type Point = { x: number; y: number };
 type GameMode = 'QUICK' | 'LEVEL' | 'MULTIPLAYER';
 type GameState = 'MENU' | 'LEVEL_SELECT' | 'PLAYING' | 'SETTINGS' | 'MULTIPLAYER_MENU' | 'LOBBY' | 'INTERMISSION';
 type ControlType = 'JOYSTICK' | 'DPAD';
-
-interface MultiplayerPlayer {
-  id: string;
-  name: string;
-  color: string;
-  ready: boolean;
-  x: number;
-  y: number;
-  hasKey: boolean;
-  escaped: boolean;
-  placement?: number;
-  eliminated: boolean;
-}
-
-interface Lobby {
-  id: string;
-  hostId: string;
-  players: MultiplayerPlayer[];
-  gameState: 'LOBBY' | 'STARTING' | 'PLAYING' | 'FINISHED';
-  gameMode?: 'BEST_OF_3' | 'BATTLE_ROYALE';
-  maze: number[][] | null;
-  exitPos: Point | null;
-  keyPos: Point | null;
-  startTime: number | null;
-  timeLimit?: number | null;
-  round: number;
-  wins: Record<string, number>;
-  eliminationOrder: string[];
-  lastRoundWinnerId?: string;
-  lastRoundEliminatedIds?: string[];
-}
 
 interface Level {
   id: number;
@@ -92,6 +78,16 @@ class SeededRandom {
   }
 }
 
+type MazeySocket = Socket<ServerToClientEvents, ClientToServerEvents>;
+
+function normalizeBestTimes(
+  bestTimes: Record<string, number>,
+): Record<number, number> {
+  return Object.fromEntries(
+    Object.entries(bestTimes).map(([levelId, time]) => [Number(levelId), time]),
+  ) as Record<number, number>;
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -118,7 +114,7 @@ export default function App() {
   const [dpadInput, setDpadInput] = useState<{ up: boolean; down: boolean; left: boolean; right: boolean }>({
     up: false, down: false, left: false, right: false
   });
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [socket, setSocket] = useState<MazeySocket | null>(null);
   const [lobby, setLobby] = useState<Lobby | null>(null);
   const [lobbyIdInput, setLobbyIdInput] = useState('');
   const [spectatingId, setSpectatingId] = useState<string | null>(null);
@@ -146,148 +142,181 @@ export default function App() {
 
   // Socket Connection
   useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
+    if (isAuthLoading || !user) {
+      setSocket(null);
+      return;
+    }
 
-    newSocket.on("lobby_joined", (data: Lobby) => {
-      setLobby(data);
-      setGameState('LOBBY');
-      setIsMultiplayer(true);
-    });
+    let cancelled = false;
+    let newSocket: MazeySocket | null = null;
 
-    newSocket.on("lobby_updated", (data: Lobby) => {
-      setLobby(data);
-      // Sync multiplayer players if in game
-      setMultiplayerPlayers(prev => {
-        const newMap = { ...prev };
-        const currentIds = data.players.map(p => p.id);
-        Object.keys(newMap).forEach(id => {
-          if (!currentIds.includes(id)) {
-            delete newMap[id];
-          }
+    const connectSocket = async () => {
+      try {
+        const idToken = await getCurrentUserIdToken();
+
+        if (cancelled) {
+          return;
+        }
+
+        newSocket = io(SOCKET_URL, {
+          auth: {
+            token: idToken,
+          },
         });
-        return newMap;
-      });
-    });
+        setSocket(newSocket);
 
-    newSocket.on("game_starting", (data: { countdown: number }) => {
-      setCountdown(data.countdown);
-      setMaze([]);
-      mazeRef.current = [];
-      setAllOpponentsQuit(false);
-      setIntermission({ active: false, countdown: 0, lobby: null });
-      const interval = setInterval(() => {
-        setCountdown(prev => (prev !== null && prev > 1) ? prev - 1 : null);
-      }, 1000);
-      setTimeout(() => clearInterval(interval), 3000);
-    });
+        newSocket.on("lobby_joined", (data: Lobby) => {
+          setLobby(data);
+          setGameState('LOBBY');
+          setIsMultiplayer(true);
+        });
 
-    newSocket.on("game_started", (data) => {
-      setMaze(data.maze);
-      mazeRef.current = data.maze;
-      setMazeSize({ w: data.maze[0].length, h: data.maze.length });
-      setExitPos(data.exitPos);
-      exitRef.current = data.exitPos;
-      setKeyPos(data.keyPos);
-      keyRef.current = data.keyPos;
-      setHasKey(false);
-      hasKeyRef.current = false;
-      setIsEscaped(false);
-      setIsGameOver(false);
-      setGameStarted(true);
-      setStartTime(Date.now());
-      setGameState('PLAYING');
-      setGameMode('MULTIPLAYER');
-      setCountdown(null);
-      setMultiplayerTimeLimit(data.timeLimit || null);
-      
-      const playersMap: Record<string, MultiplayerPlayer> = {};
-      data.players.forEach((p: MultiplayerPlayer) => {
-        playersMap[p.id] = p;
-      });
-      setMultiplayerPlayers(playersMap);
-      setPlayerPos({ x: 48, y: 48 });
-      playerRef.current = { x: 48, y: 48 };
-      setSpectatingId(null);
-    });
+        newSocket.on("lobby_updated", (data: Lobby) => {
+          setLobby(data);
+          setMultiplayerPlayers(prev => {
+            const newMap = { ...prev };
+            const currentIds = data.players.map(p => p.id);
+            Object.keys(newMap).forEach(id => {
+              if (!currentIds.includes(id)) {
+                delete newMap[id];
+              }
+            });
+            return newMap;
+          });
+        });
 
-    newSocket.on("player_abandoned", (data: { name: string, id: string }) => {
-      console.log("Player abandoned:", data.name, data.id);
-      const id = Math.random().toString(36).substring(2, 9);
-      setNotifications(prev => [...prev, { id, message: `${data.name} abandoned the match` }]);
-      setMultiplayerPlayers(prev => {
-        const newMap = { ...prev };
-        delete newMap[data.id];
-        return newMap;
-      });
-      setTimeout(() => {
-        setNotifications(prev => prev.filter(n => n.id !== id));
-      }, 5000);
-    });
+        newSocket.on("game_starting", (data) => {
+          setCountdown(data.countdown);
+          setMaze([]);
+          mazeRef.current = [];
+          setAllOpponentsQuit(false);
+          setIntermission({ active: false, countdown: 0, lobby: null });
+          const interval = setInterval(() => {
+            setCountdown(prev => (prev !== null && prev > 1) ? prev - 1 : null);
+          }, 1000);
+          setTimeout(() => clearInterval(interval), 3000);
+        });
 
-    newSocket.on("player_escaped_notification", (data: { name: string, id: string }) => {
-      const id = Math.random().toString(36).substring(2, 9);
-      setNotifications(prev => [...prev, { id, message: `${data.name} escaped!` }]);
-      setTimeout(() => {
-        setNotifications(prev => prev.filter(n => n.id !== id));
-      }, 5000);
-    });
+        newSocket.on("game_started", (data) => {
+          setMaze(data.maze);
+          mazeRef.current = data.maze;
+          setMazeSize({ w: data.maze[0].length, h: data.maze.length });
+          setExitPos(data.exitPos);
+          exitRef.current = data.exitPos;
+          setKeyPos(data.keyPos);
+          keyRef.current = data.keyPos;
+          setHasKey(false);
+          hasKeyRef.current = false;
+          setIsEscaped(false);
+          setIsGameOver(false);
+          setGameStarted(true);
+          setStartTime(Date.now());
+          setGameState('PLAYING');
+          setGameMode('MULTIPLAYER');
+          setCountdown(null);
+          setMultiplayerTimeLimit(data.timeLimit || null);
+          
+          const playersMap: Record<string, MultiplayerPlayer> = {};
+          data.players.forEach((p: MultiplayerPlayer) => {
+            playersMap[p.id] = p;
+          });
+          setMultiplayerPlayers(playersMap);
+          setPlayerPos({ x: 48, y: 48 });
+          playerRef.current = { x: 48, y: 48 };
+          setSpectatingId(null);
+        });
 
-    newSocket.on("round_intermission", (data: Lobby) => {
-      setLobby(data);
-      setGameState('INTERMISSION');
-      setIntermission({ active: true, countdown: 5, lobby: data });
-      const interval = setInterval(() => {
-        setIntermission(prev => ({ ...prev, countdown: prev.countdown > 0 ? prev.countdown - 1 : 0 }));
-      }, 1000);
-      setTimeout(() => clearInterval(interval), 5000);
-    });
+        newSocket.on("player_abandoned", (data) => {
+          const id = Math.random().toString(36).substring(2, 9);
+          setNotifications(prev => [...prev, { id, message: `${data.name} abandoned the match` }]);
+          setMultiplayerPlayers(prev => {
+            const newMap = { ...prev };
+            delete newMap[data.id];
+            return newMap;
+          });
+          setTimeout(() => {
+            setNotifications(prev => prev.filter(n => n.id !== id));
+          }, 5000);
+        });
 
-    newSocket.on("all_opponents_quit", () => {
-      setAllOpponentsQuit(true);
-    });
+        newSocket.on("player_escaped_notification", (data) => {
+          const id = Math.random().toString(36).substring(2, 9);
+          setNotifications(prev => [...prev, { id, message: `${data.name} escaped!` }]);
+          setTimeout(() => {
+            setNotifications(prev => prev.filter(n => n.id !== id));
+          }, 5000);
+        });
 
-    newSocket.on("player_moved", (data: { id: string, x: number, y: number }) => {
-      setMultiplayerPlayers(prev => {
-        if (!prev[data.id]) return prev;
-        return {
-          ...prev,
-          [data.id]: { ...prev[data.id], x: data.x, y: data.y }
-        };
-      });
-    });
+        newSocket.on("round_intermission", (data: Lobby) => {
+          setLobby(data);
+          setGameState('INTERMISSION');
+          setIntermission({ active: true, countdown: 5, lobby: data });
+          const interval = setInterval(() => {
+            setIntermission(prev => ({ ...prev, countdown: prev.countdown > 0 ? prev.countdown - 1 : 0 }));
+          }, 1000);
+          setTimeout(() => clearInterval(interval), 5000);
+        });
 
-    newSocket.on("player_updated", (data: MultiplayerPlayer) => {
-      setMultiplayerPlayers(prev => {
-        if (!prev[data.id]) return prev;
-        return {
-          ...prev,
-          [data.id]: data
-        };
-      });
-    });
+        newSocket.on("all_opponents_quit", () => {
+          setAllOpponentsQuit(true);
+        });
 
-    newSocket.on("player_eliminated", (id: string) => {
-      setMultiplayerPlayers(prev => {
-        if (!prev[id]) return prev;
-        return {
-          ...prev,
-          [id]: { ...prev[id], eliminated: true }
-        };
-      });
-    });
+        newSocket.on("player_moved", (data) => {
+          setMultiplayerPlayers(prev => {
+            if (!prev[data.id]) return prev;
+            return {
+              ...prev,
+              [data.id]: { ...prev[data.id], x: data.x, y: data.y }
+            };
+          });
+        });
 
-    newSocket.on("game_finished", (data: Lobby) => {
-      setLobby(data);
-      setIsEscaped(true); // Trigger end game screen
-    });
+        newSocket.on("player_updated", (data: MultiplayerPlayer) => {
+          setMultiplayerPlayers(prev => {
+            if (!prev[data.id]) return prev;
+            return {
+              ...prev,
+              [data.id]: data
+            };
+          });
+        });
 
-    newSocket.on("error", (msg: string) => {
-      alert(msg);
-    });
+        newSocket.on("player_eliminated", (id: string) => {
+          setMultiplayerPlayers(prev => {
+            if (!prev[id]) return prev;
+            return {
+              ...prev,
+              [id]: { ...prev[id], eliminated: true }
+            };
+          });
+        });
 
-    return () => { newSocket.close(); };
-  }, []);
+        newSocket.on("game_finished", (data: Lobby) => {
+          setLobby(data);
+          setIsEscaped(true);
+        });
+
+        newSocket.on("error", (msg: string) => {
+          alert(msg);
+        });
+
+        newSocket.on("connect_error", (error) => {
+          alert(error.message);
+        });
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Unable to connect multiplayer socket:', error);
+        }
+      }
+    };
+
+    void connectSocket();
+
+    return () => {
+      cancelled = true;
+      newSocket?.close();
+    };
+  }, [user, isAuthLoading]);
 
   // Auth Listener
   useEffect(() => {
@@ -298,40 +327,22 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Load best times from LocalStorage and Firestore
+  // Load best times from LocalStorage and API
   useEffect(() => {
     const loadProgress = async () => {
-      // 1. Load from LocalStorage first for immediate UI
       const saved = localStorage.getItem('neon_rush_best_times');
-      let localBestTimes = saved ? JSON.parse(saved) : {};
+      const localBestTimes = saved ? JSON.parse(saved) as Record<number, number> : {};
       setBestTimes(localBestTimes);
 
-      // 2. If logged in, sync with Firestore
       if (user) {
-        const userPath = `users/${user.uid}`;
         try {
-          const userDoc = await getDoc(doc(db, 'users', user.uid));
-          if (userDoc.exists()) {
-            const remoteBestTimes = userDoc.data().bestTimes || {};
-            // Merge: Remote takes precedence for same level, but keep local-only levels
-            const merged = { ...localBestTimes, ...remoteBestTimes };
-            setBestTimes(merged);
-            localStorage.setItem('neon_rush_best_times', JSON.stringify(merged));
-          } else {
-            // Create user doc if it doesn't exist
-            await setDoc(doc(db, 'users', user.uid), {
-              uid: user.uid,
-              displayName: user.displayName,
-              email: user.email,
-              photoURL: user.photoURL,
-              bestTimes: localBestTimes,
-              totalEscapes: 0,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp()
-            });
-          }
+          const profile = await getCurrentUserProfile();
+          const remoteBestTimes = normalizeBestTimes(profile.bestTimes);
+          const merged = { ...localBestTimes, ...remoteBestTimes };
+          setBestTimes(merged);
+          localStorage.setItem('neon_rush_best_times', JSON.stringify(merged));
         } catch (error) {
-          handleFirestoreError(error, OperationType.GET, userPath);
+          console.error('Failed to load progress from the API:', error);
         }
       }
     };
@@ -352,16 +363,14 @@ export default function App() {
       setBestTimes(newBestTimes);
       localStorage.setItem('neon_rush_best_times', JSON.stringify(newBestTimes));
 
-      // Sync to Firestore if logged in
       if (user) {
-        const userPath = `users/${user.uid}`;
         try {
-          await updateDoc(doc(db, 'users', user.uid), {
-            [`bestTimes.${levelId}`]: time,
-            updatedAt: serverTimestamp()
-          });
+          const profile = await updateBestTime(levelId, time);
+          const syncedBestTimes = normalizeBestTimes(profile.bestTimes);
+          setBestTimes(syncedBestTimes);
+          localStorage.setItem('neon_rush_best_times', JSON.stringify(syncedBestTimes));
         } catch (error) {
-          handleFirestoreError(error, OperationType.UPDATE, userPath);
+          console.error('Failed to save best time through the API:', error);
         }
       }
     }
@@ -1007,6 +1016,8 @@ export default function App() {
   }
 
   if (gameState === 'MULTIPLAYER_MENU') {
+    const canUseMultiplayer = Boolean(user && socket);
+
     return (
       <div className="min-h-screen bg-slate-950 text-slate-50 flex flex-col items-center p-8 font-sans">
         <div className="max-w-2xl w-full space-y-12">
@@ -1031,7 +1042,8 @@ export default function App() {
               </div>
               <button 
                 onClick={() => socket?.emit('host_lobby', { name: user?.displayName || 'Player' })}
-                className="w-full py-4 bg-cyan-500 text-white rounded-2xl font-black hover:bg-cyan-400 transition-all active:scale-95 shadow-lg shadow-cyan-500/20"
+                disabled={!canUseMultiplayer}
+                className="w-full py-4 bg-cyan-500 text-white rounded-2xl font-black hover:bg-cyan-400 transition-all active:scale-95 shadow-lg shadow-cyan-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Create Lobby
               </button>
@@ -1055,12 +1067,19 @@ export default function App() {
                 />
                 <button 
                   onClick={() => socket?.emit('join_lobby', { lobbyId: lobbyIdInput, name: user?.displayName || 'Player' })}
-                  className="w-full py-4 bg-slate-800 text-white rounded-2xl font-black hover:bg-slate-700 transition-all active:scale-95"
+                  disabled={!canUseMultiplayer}
+                  className="w-full py-4 bg-slate-800 text-white rounded-2xl font-black hover:bg-slate-700 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Join Lobby
                 </button>
               </div>
             </div>
+
+            {!user && (
+              <div className="md:col-span-2 p-4 bg-amber-500/10 border border-amber-500/20 rounded-2xl text-sm text-amber-200">
+                Sign in with Google to use the NestJS multiplayer service.
+              </div>
+            )}
 
             <div className="md:col-span-2 p-8 bg-slate-900/30 border border-slate-800/50 border-dashed rounded-[2rem] flex flex-col items-center justify-center text-center space-y-4 opacity-60">
               <div className="w-12 h-12 bg-slate-800/50 rounded-2xl flex items-center justify-center">
@@ -1141,7 +1160,7 @@ export default function App() {
               <section className="space-y-4">
                 <h2 className="text-sm font-bold text-slate-500 uppercase tracking-widest">Your Color</h2>
                 <div className="grid grid-cols-3 gap-3">
-                  {['#22d3ee', '#fbbf24', '#f43f5e', '#10b981', '#a855f7', '#f97316'].map((c) => {
+                  {PLAYER_COLORS.map((c) => {
                     const isTaken = lobby.players.some(p => p.color === c && p.id !== socket?.id);
                     return (
                       <button
